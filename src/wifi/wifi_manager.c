@@ -119,8 +119,20 @@ void wifi_manager_status(char *buf, size_t len)
     if (s_connected) {
         esp_netif_ip_info_t ip_info = {};
         esp_netif_get_ip_info(s_sta_netif, &ip_info);
-        snprintf(buf, len, "WiFi: connected to \"%s\", IP: " IPSTR,
-                 config_get_ssid(), IP2STR(&ip_info.ip));
+
+        wifi_ap_record_t ap = {};
+        esp_wifi_sta_get_ap_info(&ap);
+
+        /* Classify RSSI into a human-readable label */
+        const char *quality;
+        if      (ap.rssi >= -50) quality = "excellent";
+        else if (ap.rssi >= -65) quality = "good";
+        else if (ap.rssi >= -75) quality = "fair";
+        else                     quality = "weak";
+
+        snprintf(buf, len,
+                 "WiFi: connected to \"%s\", IP: " IPSTR ", RSSI: %d dBm (%s)",
+                 config_get_ssid(), IP2STR(&ip_info.ip), ap.rssi, quality);
     } else {
         snprintf(buf, len, "WiFi: disconnected");
     }

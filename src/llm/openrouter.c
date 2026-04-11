@@ -1,6 +1,7 @@
 #include "openrouter.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
+#include "esp_timer.h"
 #include "cJSON.h"
 #include <string.h>
 #include <stdlib.h>
@@ -40,123 +41,26 @@ static void process_sse_line(const char *line, llm_token_cb_t on_token, void *ct
     cJSON_Delete(root);
 }
 
-/* ── Persistent session state ─────────────────────────────────────────── */
+/* Wraps the caller's on_token to record the timestamp of the first call. */
+typedef struct {
+    llm_token_cb_t  real_cb;
+    void           *real_ctx;
+    int64_t         t_first;   /* -1 until first token arrives */
+} token_timing_ctx_t;
 
-static esp_http_client_handle_t s_client = NULL;
-
-/*
- * Send a pre-built request body on 'client' and stream the SSE response.
- * Calls esp_http_client_close() on both success and failure so the caller
- * can re-use the handle.  With keep_alive_enable the underlying TCP/TLS
- * socket stays open across calls.
- */
-static esp_err_t perform_request(esp_http_client_handle_t client,
-                                  const char *body, int body_len,
-                                  llm_token_cb_t on_token, void *ctx)
+static void timing_on_token(const char *token, size_t len, void *ctx)
 {
-    esp_err_t err = esp_http_client_open(client, body_len);
-    if (err != ESP_OK) return err;
-
-    if (esp_http_client_write(client, body, body_len) < 0) {
-        esp_http_client_close(client);
-        return ESP_FAIL;
-    }
-
-    esp_http_client_fetch_headers(client);
-
-    int http_status = esp_http_client_get_status_code(client);
-    if (http_status != 200) {
-        esp_http_client_close(client);
-        return ESP_FAIL;
-    }
-
-    /* Allocate SSE parsing buffers on heap to avoid blowing the task stack. */
-    char *line_buf = malloc(SSE_LINE_BUF_SIZE);
-    char *read_buf = malloc(HTTP_READ_BUF_SIZE);
-    if (!line_buf || !read_buf) {
-        free(line_buf);
-        free(read_buf);
-        esp_http_client_close(client);
-        return ESP_ERR_NO_MEM;
-    }
-
-    int line_pos = 0;
-    int read_len;
-
-    while ((read_len = esp_http_client_read(client, read_buf,
-                                             HTTP_READ_BUF_SIZE)) > 0) {
-        for (int i = 0; i < read_len; i++) {
-            char c = read_buf[i];
-            if (c == '\n') {
-                /* Strip trailing CR if present */
-                if (line_pos > 0 && line_buf[line_pos - 1] == '\r') {
-                    line_pos--;
-                }
-                line_buf[line_pos] = '\0';
-                if (line_pos > 0) {
-                    process_sse_line(line_buf, on_token, ctx);
-                }
-                line_pos = 0;
-            } else if (line_pos < SSE_LINE_BUF_SIZE - 1) {
-                line_buf[line_pos++] = c;
-            }
-        }
-    }
-
-    free(line_buf);
-    free(read_buf);
-    esp_http_client_close(client);  /* keeps TCP/TLS alive when keep_alive_enable=true */
-    return ESP_OK;
-}
-
-static esp_err_t openrouter_session_open(const char *api_key)
-{
-    if (s_client) {
-        esp_http_client_cleanup(s_client);
-        s_client = NULL;
-    }
-
-    esp_http_client_config_t cfg = {
-        .url               = OPENROUTER_URL,
-        .method            = HTTP_METHOD_POST,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .timeout_ms        = 60000,
-        .keep_alive_enable = true,
-    };
-
-    s_client = esp_http_client_init(&cfg);
-    if (!s_client) return ESP_FAIL;
-
-    size_t auth_len = strlen("Bearer ") + strlen(api_key) + 1;
-    char  *auth     = malloc(auth_len);
-    if (!auth) {
-        esp_http_client_cleanup(s_client);
-        s_client = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-    snprintf(auth, auth_len, "Bearer %s", api_key);
-
-    esp_http_client_set_header(s_client, "Content-Type",  "application/json");
-    esp_http_client_set_header(s_client, "Authorization", auth);
-    esp_http_client_set_header(s_client, "HTTP-Referer",
-                               "https://github.com/vintage-serial-llm");
-    free(auth);
-    return ESP_OK;
-}
-
-static void openrouter_session_close(void)
-{
-    if (s_client) {
-        esp_http_client_cleanup(s_client);
-        s_client = NULL;
-    }
+    token_timing_ctx_t *w = (token_timing_ctx_t *)ctx;
+    if (w->t_first < 0) w->t_first = esp_timer_get_time();
+    w->real_cb(token, len, w->real_ctx);
 }
 
 static esp_err_t openrouter_stream_chat(const char     *api_key,
                                          const char     *model,
                                          const cJSON    *messages,
                                          llm_token_cb_t  on_token,
-                                         void           *ctx)
+                                         void           *ctx,
+                                         llm_timing_t   *timing)
 {
     if (!api_key || api_key[0] == '\0') return ESP_ERR_INVALID_ARG;
     if (!model   || model[0]   == '\0') return ESP_ERR_INVALID_ARG;
@@ -181,56 +85,109 @@ static esp_err_t openrouter_stream_chat(const char     *api_key,
 
     int body_len = (int)strlen(body);
 
-    /*
-     * Use the persistent session client when available.
-     * Fall back to a temporary one-shot client if session_open was not called
-     * (e.g. direct / test usage).
-     */
-    int owns_client = (s_client == NULL);
-    esp_http_client_handle_t client = s_client;
-
-    if (owns_client) {
-        esp_http_client_config_t cfg = {
-            .url               = OPENROUTER_URL,
-            .method            = HTTP_METHOD_POST,
-            .crt_bundle_attach = esp_crt_bundle_attach,
-            .timeout_ms        = 60000,
-        };
-        client = esp_http_client_init(&cfg);
-        if (!client) { free(body); return ESP_FAIL; }
-        esp_http_client_set_header(client, "Content-Type", "application/json");
-        esp_http_client_set_header(client, "HTTP-Referer",
-                                   "https://github.com/vintage-serial-llm");
-    }
-
-    /* Always refresh Authorization in case api_key differs from session_open. */
+    /* Build Authorization header value. */
     size_t auth_len = strlen("Bearer ") + strlen(api_key) + 1;
     char  *auth_header = malloc(auth_len);
     if (!auth_header) {
-        if (owns_client) esp_http_client_cleanup(client);
         free(body);
         return ESP_ERR_NO_MEM;
     }
     snprintf(auth_header, auth_len, "Bearer %s", api_key);
-    esp_http_client_set_header(client, "Authorization", auth_header);
-    free(auth_header);
 
-    esp_err_t err = perform_request(client, body, body_len, on_token, ctx);
-
-    /* If the persistent connection was stale, retry once — the underlying
-       socket will reconnect and attempt TLS session resumption. */
-    if (err != ESP_OK && !owns_client) {
-        err = perform_request(client, body, body_len, on_token, ctx);
+    /* Fresh client for every request — no keep-alive, no reuse. */
+    esp_http_client_config_t http_cfg = {
+        .url               = OPENROUTER_URL,
+        .method            = HTTP_METHOD_POST,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms        = 60000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&http_cfg);
+    if (!client) {
+        free(auth_header);
+        free(body);
+        return ESP_FAIL;
     }
 
+    esp_http_client_set_header(client, "Content-Type",  "application/json");
+    esp_http_client_set_header(client, "Authorization", auth_header);
+    esp_http_client_set_header(client, "HTTP-Referer",
+                               "https://github.com/vintage-serial-llm");
+    free(auth_header);
+
+    /* ── Timed request ─────────────────────────────────────────────── */
+    int64_t t0  = esp_timer_get_time();
+    esp_err_t err = esp_http_client_open(client, body_len);
+    int64_t t1  = esp_timer_get_time();
+    if (timing) timing->connect_ms = (int32_t)((t1 - t0) / 1000);
+
+    if (err != ESP_OK) goto cleanup;
+
+    if (esp_http_client_write(client, body, body_len) < 0) {
+        err = ESP_FAIL;
+        goto cleanup_close;
+    }
+
+    esp_http_client_fetch_headers(client);
+    int64_t t2 = esp_timer_get_time();
+
+    if (esp_http_client_get_status_code(client) != 200) {
+        err = ESP_FAIL;
+        goto cleanup_close;
+    }
+
+    {
+        char *line_buf = malloc(SSE_LINE_BUF_SIZE);
+        char *read_buf = malloc(HTTP_READ_BUF_SIZE);
+        if (!line_buf || !read_buf) {
+            free(line_buf);
+            free(read_buf);
+            err = ESP_ERR_NO_MEM;
+            goto cleanup_close;
+        }
+
+        token_timing_ctx_t wrap = {
+            .real_cb  = on_token,
+            .real_ctx = ctx,
+            .t_first  = -1,
+        };
+
+        int  line_pos = 0;
+        int  read_len;
+
+        while ((read_len = esp_http_client_read(client, read_buf,
+                                                 HTTP_READ_BUF_SIZE)) > 0) {
+            for (int i = 0; i < read_len; i++) {
+                char c = read_buf[i];
+                if (c == '\n') {
+                    if (line_pos > 0 && line_buf[line_pos - 1] == '\r') line_pos--;
+                    line_buf[line_pos] = '\0';
+                    if (line_pos > 0) process_sse_line(line_buf, timing_on_token, &wrap);
+                    line_pos = 0;
+                } else if (line_pos < SSE_LINE_BUF_SIZE - 1) {
+                    line_buf[line_pos++] = c;
+                }
+            }
+        }
+
+        int64_t t_end = esp_timer_get_time();
+        if (timing && wrap.t_first >= 0) {
+            timing->server_ms = (int32_t)((wrap.t_first - t2)           / 1000);
+            timing->stream_ms = (int32_t)((t_end        - wrap.t_first) / 1000);
+        }
+
+        free(line_buf);
+        free(read_buf);
+    }
+
+cleanup_close:
+    esp_http_client_close(client);
+cleanup:
+    esp_http_client_cleanup(client);
     free(body);
-    if (owns_client) esp_http_client_cleanup(client);
     return err;
 }
 
 const llm_provider_t openrouter_provider = {
-    .name          = "openrouter",
-    .session_open  = openrouter_session_open,
-    .session_close = openrouter_session_close,
-    .stream_chat   = openrouter_stream_chat,
+    .name        = "openrouter",
+    .stream_chat = openrouter_stream_chat,
 };

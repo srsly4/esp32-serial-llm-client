@@ -54,23 +54,41 @@ void uart_writeln(const char *msg)
     uart_write_bytes(UART_PORT, "\r\n", 2);
 }
 
+/* Write buf, replacing bare \n with \r\n for Windows 9x terminals. */
+static void write_crlf(const char *buf, size_t len)
+{
+    size_t start = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (buf[i] == '\n' && (i == 0 || buf[i - 1] != '\r')) {
+            if (i > start) {
+                uart_write_bytes(UART_PORT, buf + start, i - start);
+            }
+            uart_write_bytes(UART_PORT, "\r\n", 2);
+            start = i + 1;
+        }
+    }
+    if (start < len) {
+        uart_write_bytes(UART_PORT, buf + start, len - start);
+    }
+}
+
 void uart_write_text(const char *utf8, size_t len)
 {
     if (!utf8 || len == 0) return;
 
     if (encoding_get() == ENCODING_UTF8) {
-        uart_write_bytes(UART_PORT, utf8, len);
+        write_crlf(utf8, len);
         return;
     }
 
     /* Output is always <= input length, so a same-sized heap buffer suffices. */
     char *buf = malloc(len);
     if (!buf) {
-        uart_write_bytes(UART_PORT, utf8, len); /* fallback — send raw */
+        write_crlf(utf8, len); /* fallback — send raw but still fix newlines */
         return;
     }
     size_t out_len = encoding_utf8_to_target(utf8, len, buf, len);
-    uart_write_bytes(UART_PORT, buf, out_len);
+    write_crlf(buf, out_len);
     free(buf);
 }
 

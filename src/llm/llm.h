@@ -13,23 +13,31 @@
 typedef void (*llm_token_cb_t)(const char *token, size_t len, void *ctx);
 
 /*
+ * Per-request timing breakdown filled in by the provider.
+ * All values are in milliseconds; 0 means the stage was not reached.
+ *   connect_ms — TCP connect + TLS handshake (esp_http_client_open)
+ *   server_ms  — request sent → first streaming token received
+ *   stream_ms  — first token → last token (streaming body)
+ */
+typedef struct {
+    int32_t connect_ms;
+    int32_t server_ms;
+    int32_t stream_ms;
+} llm_timing_t;
+
+/*
  * Abstract LLM provider.
- * session_open / session_close are optional (may be NULL).
- *   session_open  — called once when a chat session starts; may establish a
- *                   persistent TLS connection to avoid per-request handshakes.
- *   session_close — called when the chat session ends; tears down the connection.
  * stream_chat sends the messages array and calls on_token for every
  * response fragment until the stream ends.
  */
 typedef struct {
     const char *name;
-    esp_err_t (*session_open)(const char *api_key);    /* optional */
-    void      (*session_close)(void);                   /* optional */
     esp_err_t (*stream_chat)(const char     *api_key,
                               const char     *model,
                               const cJSON    *messages,   /* JSON array */
                               llm_token_cb_t  on_token,
-                              void           *ctx);
+                              void           *ctx,
+                              llm_timing_t   *timing);    /* out, may be NULL */
 } llm_provider_t;
 
 void             llm_register(const llm_provider_t *provider);

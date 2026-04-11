@@ -31,11 +31,30 @@ static void on_token(const char *token, size_t len, void *ctx_ptr)
 
 void chat_start(void)
 {
+    llm_provider_t *provider = llm_get_provider(config_get_provider());
+    if (!provider) {
+        uart_writeln("Error: unknown provider. Use /provider <name> [api_key]");
+        return;
+    }
+    if (config_get_api_key()[0] == '\0') {
+        uart_writeln("Error: no API key set. Use /provider <name> <api_key>");
+        return;
+    }
+
+    if (provider->session_open) {
+        uart_writeln("Connecting...");
+        if (provider->session_open(config_get_api_key()) != ESP_OK) {
+            uart_writeln("Error: failed to connect. Check WiFi and API key.");
+            return;
+        }
+    }
+
     uart_writeln("Chat started. Type /end or Ctrl-D to exit.");
 
     cJSON *history = cJSON_CreateArray();
     if (!history) {
         uart_writeln("Error: out of memory.");
+        if (provider->session_close) provider->session_close();
         return;
     }
 
@@ -46,6 +65,7 @@ void chat_start(void)
         free(line);
         free(resp_buf);
         cJSON_Delete(history);
+        if (provider->session_close) provider->session_close();
         return;
     }
 
@@ -56,17 +76,6 @@ void chat_start(void)
         if (len < 0) break;                      /* Ctrl-D */
         if (strcmp(line, "/end") == 0) break;
         if (len == 0) continue;
-
-        /* Validate prerequisites */
-        llm_provider_t *provider = llm_get_provider(config_get_provider());
-        if (!provider) {
-            uart_writeln("Error: unknown provider. Use /provider <name> [api_key]");
-            continue;
-        }
-        if (config_get_api_key()[0] == '\0') {
-            uart_writeln("Error: no API key set. Use /provider <name> <api_key>");
-            continue;
-        }
 
         /* Append user turn to history */
         cJSON *user_msg = cJSON_CreateObject();
@@ -108,5 +117,6 @@ void chat_start(void)
     free(line);
     free(resp_buf);
     cJSON_Delete(history);
+    if (provider->session_close) provider->session_close();
     uart_writeln("Chat ended.");
 }

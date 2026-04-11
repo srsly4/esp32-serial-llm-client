@@ -14,11 +14,17 @@ typedef void (*llm_token_cb_t)(const char *token, size_t len, void *ctx);
 
 /*
  * Abstract LLM provider.
+ * session_open / session_close are optional (may be NULL).
+ *   session_open  — called once when a chat session starts; may establish a
+ *                   persistent TLS connection to avoid per-request handshakes.
+ *   session_close — called when the chat session ends; tears down the connection.
  * stream_chat sends the messages array and calls on_token for every
  * response fragment until the stream ends.
  */
 typedef struct {
     const char *name;
+    esp_err_t (*session_open)(const char *api_key);    /* optional */
+    void      (*session_close)(void);                   /* optional */
     esp_err_t (*stream_chat)(const char     *api_key,
                               const char     *model,
                               const cJSON    *messages,   /* JSON array */
